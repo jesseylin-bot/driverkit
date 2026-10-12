@@ -1,5 +1,6 @@
 #include "driverkit.hpp"
 #include <exception>
+#include <vector>
 
 template<typename T>
 int send_key(T& keyboard, struct DKEvent* e) {
@@ -167,13 +168,101 @@ int exit_sink() {
 
 #endif
 
+/*
+ * A HID report that changes several elements (e.g. a one-shot modifier sent
+ * together with the next key) yields one value per element, in the device's
+ * element order, which usually puts the key before the modifier. Writing them
+ * to the pipe as they arrive makes the key reach the OS before its modifier.
+ *
+ * So input_callback only buffers values, and flush_pending_events() writes
+ * them once the run loop has finished handling its sources, after reordering
+ * them the way Karabiner-Elements does (src/share/event_queue/queue.hpp).
+ *
+ * This relies on Apple's implementation, not on documented API: in IOKitUser
+ * (hid.subproj/IOHIDDevice.c) the input value callback is driven by an
+ * internal IOHIDQueue, and one run-loop callout drains that queue, calling
+ * input_callback once per value. All values of a report therefore arrive
+ * back to back within a single callout on the listener thread.
+ */
+struct PendingEvent {
+    struct DKEvent event;
+    uint64_t timestamp;
+};
+
+// Only touched on the listener thread (input_callback and the flush observer).
+static std::vector<PendingEvent> pending_events;
+
+static bool is_modifier(const struct DKEvent& e) {
+    return e.page == kHIDPage_KeyboardOrKeypad
+        && e.code >= kHIDUsage_KeyboardLeftControl && e.code <= kHIDUsage_KeyboardRightGUI;
+}
+
+/*
+ * Karabiner's needs_swap: only events with the same timestamp (i.e. from the
+ * same report) are reordered, and only around a modifier. A modifier press
+ * moves before a non-modifier, and a modifier release moves after it. Raw
+ * keyboard-array values (code 0xFFFFFFFF or 1) count as non-modifiers.
+ */
+static bool needs_swap(const PendingEvent& a, const PendingEvent& b) {
+    if (a.timestamp != b.timestamp) return false;
+    bool a_mod = is_modifier(a.event), b_mod = is_modifier(b.event);
+    if (!a_mod && b_mod && b.event.value != 0) return true;
+    if (a_mod && !b_mod && a.event.value == 0) return true;
+    return false;
+}
+
+static void flush_pending_events() {
+    if (pending_events.empty()) return;
+    // Clamp timestamps that go backwards, as Karabiner's normalize_time_stamps does.
+    for (size_t i = 1; i < pending_events.size(); ++i)
+        if (pending_events[i].timestamp < pending_events[i - 1].timestamp)
+            pending_events[i].timestamp = pending_events[i - 1].timestamp;
+    // Karabiner's sort_events: an adjacent-swap sort that steps back after
+    // each swap so a modifier can move past several keys of its report.
+    for (size_t i = 0; i + 1 < pending_events.size(); ) {
+        if (needs_swap(pending_events[i], pending_events[i + 1])) {
+            std::swap(pending_events[i], pending_events[i + 1]);
+            if (i > 0) --i;
+            continue;
+        }
+        ++i;
+    }
+    for (auto& p : pending_events)
+        write(fd[1], &p.event, sizeof(struct DKEvent));
+    pending_events.clear();
+}
+
+/*
+ * Each __CFRunLoopRun iteration notifies kCFRunLoopBeforeTimers and
+ * kCFRunLoopBeforeSources, handles version-0 sources, then (unless it is only
+ * polling because a version-0 source fired) notifies kCFRunLoopBeforeWaiting
+ * before it waits for and handles at most one mach-port (version-1) source,
+ * which is how the IOHIDDevice and notification ports are delivered.
+ * Flushing on BeforeSources therefore runs between any two such callouts even
+ * when the loop never waits, BeforeWaiting flushes before the loop sleeps
+ * (the usual case, so a report is written as soon as its callout returns),
+ * and Exit flushes when CFRunLoopStop ends the loop, before release closes
+ * the pipe.
+ */
+static void flush_observer_callback(CFRunLoopObserverRef observer, CFRunLoopActivity activity, void* info) {
+    flush_pending_events();
+}
+
 void fire_listener_thread() {
     if (!listener_thread.joinable())
         listener_thread = std::thread{
         [&]() {
             listener_loop = CFRunLoopGetCurrent();
+            CFRunLoopObserverRef flush_observer = CFRunLoopObserverCreate(kCFAllocatorDefault,
+                kCFRunLoopBeforeSources | kCFRunLoopBeforeWaiting | kCFRunLoopExit,
+                true, 0, flush_observer_callback, NULL);
+            CFRunLoopAddObserver(listener_loop, flush_observer, kCFRunLoopDefaultMode);
             capture_registered_devices();
             CFRunLoopRun();
+            CFRunLoopRemoveObserver(listener_loop, flush_observer, kCFRunLoopDefaultMode);
+            CFRelease(flush_observer);
+            // The Exit observer has already flushed; never carry events into a later regrab_input().
+            pending_events.clear();
         } };
 }
 
@@ -184,7 +273,7 @@ void input_callback(void* context, IOReturn result, void* sender, IOHIDValueRef 
     e.page = IOHIDElementGetUsagePage(element);
     e.code = IOHIDElementGetUsage(element);
     e.device_hash = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(context));
-    write(fd[1], &e, sizeof(struct DKEvent));
+    pending_events.push_back({e, IOHIDValueGetTimeStamp(value)});
 }
 
 void device_connected_callback(void* context, io_iterator_t iter) {
